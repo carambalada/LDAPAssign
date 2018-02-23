@@ -1,6 +1,9 @@
 # Sensitive data
 config.py
 
+# File for quick tests
+s.py
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

@@ -1,9 +1,15 @@
 # LDAPAssign
 LDAP. Placing accounts to groups based on a given text configuration
 
-Configuration example:
+Configuration example (config.py):
 
-### config.py ###
+```python
+ldap_settings = {
+ 'hostname': 'host',
+ 'user_dn': 'cn=bind_user,ou=service,dc=company,dc=domain',
+ 'password': 'pass'
+}
+
 groups = [
  { 'name': 'Group1',
    'patterns':
@@ -30,4 +36,4 @@ users = [
  'user21-usr',
  'userXX-usr',
 ]
-###
+```
