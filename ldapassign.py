@@ -4,11 +4,15 @@
 # - create groups if they don't exist
 
 import ldap
+import copy
+import ldap.modlist as modlist
 import config
+import pickle
+import classgroup
 
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 #
-# LDAP: Binding
+# LDAP binding
 #
 def ldap_connection(hostname, username, password):
  url = "ldap://" + hostname
@@ -31,11 +35,11 @@ def ldap_connection(hostname, username, password):
 
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 #
-# LDAP: Getting list of users
+# Getting list of users
 #
-def get_users(b, settings):
+def get_users(bind, settings):
  users = []
- result_id = b.search(
+ result_id = bind.search(
   settings['base'],
   settings['scope'],
   settings['filter'],
@@ -43,49 +47,28 @@ def get_users(b, settings):
   settings['attrsonly']
   )
  
- result_type, result_data = b.result(result_id, 1)
- #print(str(result_type))
- #print(str(result_data))
- if result_data != []:
+ result_type, result_data = bind.result(result_id, 1)
+ if result_data:
   for entry in result_data:
    users.append(
     { 'dn': entry[0],
       'uid': entry[1]['uid'][0]
     }
    )
-  return users
  else:
   print('No configured users found in LDAP - imposible to continue')
   exit(1)
- 
+
+ return users
 
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 #
-# Getting matching groups
+# Getting list of groups
 #
-def get_matching_groups(user, groups):
- groups_match = []
- for group in groups:
-  for pattern in group['patterns']:
-   if user['uid'].startswith(pattern):
-    groups_match.append(group)
-    break
- return groups_match
-
-# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-#
-# LDAP: Making a list of groups from the config plus:
-#        - memberUid
-#        - number of members
-#
-def get_groups(bind, config_groups, settings):
- #
- # making a filter like '(&(objectClass=posixGroup)(cn=Group1))
- # TODO: check that at least one group is valid for forming the filter
- #
- groups = []
- for group in config_groups:
-  search_filter = '(&' + settings['filter'] + '(cn=' + group['name'] + '))'
+def get_groups(bind, conf_groups, settings):
+ glist = []
+ for conf_group in conf_groups:
+  search_filter = '(&' + settings['filter'] + '(cn=' + conf_group['name'] + '))'
   result_id = bind.search(
    settings['base'],
    settings['scope'],
@@ -93,69 +76,85 @@ def get_groups(bind, config_groups, settings):
    settings['attributes'],
    settings['attrsonly']
    )
-  result_type, result_data = bind.result(result_id, 1)
-  if result_data != []:
-   if result_data[0][1] != {}:
-    group['memberUid'] = result_data[0][1]['memberUid']
-    group['current'] = len(group['memberUid'])
-   else:
-    group['memberUid'] = []
-    group['current'] = 0
-   groups.append(group)
+  bind_type, bind_data = bind.result(result_id, 1)
+  if bind_data:
+   glist.append(classgroup.group(conf_group, bind_data[0]))
   else:
-   print('Group ' + group['name'] + ' was not found in LDAP - skipping')
+   print('Group ' + conf_group['name'] + ' was not found in LDAP - skipping')
 
- if groups != []:
-  return groups
+ if glist:
+  return glist
  else:
   print('No configured groups found in LDAP - imposible to continue')
   exit(1)
 
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 #
-# Getting users that are not found in groups
+# Getting groups that are (not) capable of filling
 #
-def get_unassigned_users(users, groups):
- #
- # is it okay to use the same variable for looping and removig operation at
- # the same time?
- #
- unassigned_users = users
- for user in users:
-  for group in groups:
-   if group['memberUid'].count(user['uid']) > 0:
-    #print('User ' + user['uid'] + ' found in group ' + group['name'])
-    unassigned_users.remove(user)
-    break
- return unassigned_users
-
-# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-#
-# Getting groups that are still unfilled
-#
-def get_unfilled_groups(groups):
- unfilled_groups = groups
+def groups_analysis(groups):
+ filled_groups = []
+ capable_groups = []
  for group in groups:
-  if group['current'] >= group['limit']:
-   unfilled_groups.remove(group)
- return unfilled_groups
+  if group.count < group.limit:
+   capable_groups.append(group)
+  else:
+   filled_groups.append(group)
+ return filled_groups, capable_groups
 
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 #
-# Arranging user to groups
+# Getting users that are not found in groups + multigroup users
 #
-def arrange(users, groups):
+def users_analysis(users, groups):
+ unassigned_users = []
+ multigroup_users = []
+ for user in users:
+  group_list = []
+  for group in groups:
+   if user['uid'] in group.members:
+    group_list.append(group.name)
+  if group_list:
+   if len(group_list) > 1:
+    user['groups'] = group_list
+    multigroup_users.append(user)
+  else:
+   unassigned_users.append(user)
+ return unassigned_users, multigroup_users
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+#
+# Assign users to capable groups
+#
+def capable_assign(users, groups):
  failed_users = []
  for user in users:
-  groups_match = get_matching_groups(user, groups)
-  if groups_match != []:
-   print('Adding user ' + user['uid'] + ' to the first unfilled group ' \
-          + groups[0]['name'])
-   groups[0]['current'] += 1
-   groups = get_unfilled_groups(groups)
-  else:
+  failed_user = True
+  for group in groups:
+   if group.append(user):
+    #print(user['uid'] + group.name)
+    failed_user = False
+    break
+   else:
+    continue
+  if failed_user:
    failed_users.append(user)
+
  return failed_users
+
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+#
+# Updating LDAP groups
+#
+def update_groups(bind, groups):
+ updated_groups = []
+ for group in groups:
+  if group.appended:
+   ldif = ldap.modlist.modifyModlist({'memberUid': ''}, {'memberUid': group.appended})
+   bind.modify_s(group.dn, ldif)
+   updated_groups.append(group)
+
+ return updated_groups
 
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 #
@@ -168,21 +167,49 @@ bind = ldap_connection(
  config.ldap['connection']['password']
  )
 
-users = get_users(bind, config.ldap['users'])
 groups = get_groups(bind, config.groups, config.ldap['groups'])
-users = get_unassigned_users(users, groups)
-groups = get_unfilled_groups(groups)
-users = arrange(users, groups)
-print(groups)
-if users != []:
- print('Groupping some users were failed due to groups\' limitation or\
- pattern dismatch. Here are some hints:')
- for user in users:
-  print('\nUser ' + user['uid'] + ':')
-  groups_match = get_matching_groups(user, config.groups)
-  if groups_match == []:
-   print(' - no matching groups found')
-  else:
-   for group in groups_match:
-    print(' - matching with group ' + group['name'] + ' (limit: ' + \
-           str(group['limit']) + ', users: ' + str(group['current']) + ')')
+#pickle.dump(groups, open( "groups.pic", "wb" ) )
+users = get_users(bind, config.ldap['users'])
+#pickle.dump(users, open( "users.pic", "wb" ) )
+
+#users = pickle.load(open( "users.pic", "rb" ))
+print('Input users: ' + str(len(users)))
+#groups = pickle.load(open( "groups.pic", "rb" ))
+print('Input groups: ' + str(len(groups)))
+unassigned_users, multigroup_users = users_analysis(users, groups)
+print('Unassigned users: ' + str(len(unassigned_users)))
+print('Multigroup users: ' + str(len(multigroup_users)))
+filled_groups, capable_groups = groups_analysis(groups)
+print('Capable groups: ' + str(len(capable_groups)))
+
+if multigroup_users:
+ print('There are users with more than one group membership:')
+ for user in multigroup_users:
+  print(' ' + user['uid'] + ': ' + str(user['groups']))
+
+if filled_groups:
+ print('Some groups have no room for appending users:')
+ for group in filled_groups:
+  print(' ' + group.name + ': ' + str(group.count) + ' with limit ' + str(group.limit))
+
+if not unassigned_users:
+ print('No unassigned users found')
+ exit(0)
+
+if capable_groups:
+ failed_users = capable_assign(unassigned_users, capable_groups)
+else:
+ print('No capable groups found')
+ exit(1)
+
+if failed_users:
+ print('There are no groups for assigning these users:')
+ for user in failed_users:
+  print(user['uid'])
+
+updated_groups = update_groups(bind, capable_groups)
+
+if updated_groups:
+ for group in updated_groups:
+  print('Group ' + group.name + ' is supposed to be updated with ' + str(len(group.appended)) + ' users and have ' + str(group.count) + ' members with limit ' + str(group.limit))
+ print('Check your groups and rerun the script if some groups remain unchanged.')
